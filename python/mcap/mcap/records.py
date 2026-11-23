@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Tuple
 
 from .data_stream import ReadDataStream, RecordBuilder
+from .exceptions import McapFormatError
 from .opcode import Opcode
 
 
@@ -126,11 +127,13 @@ class Channel(McapRecord):
         topic = stream.read_prefixed_string()
         message_encoding = stream.read_prefixed_string()
         metadata_length = stream.read4()
-        metadata_end = stream.count + metadata_length
         metadata: Dict[str, str] = {}
-        while stream.count < metadata_end:
-            key = stream.read_prefixed_string()
-            value = stream.read_prefixed_string()
+        # The map gets its own bounded range: a truncated or over-long entry cannot borrow bytes
+        # from whatever follows the map inside this record.
+        map_stream = stream.bounded(metadata_length)
+        while map_stream.remaining > 0:
+            key = map_stream.read_prefixed_string()
+            value = map_stream.read_prefixed_string()
             metadata[key] = value
         return Channel(
             id=id,
@@ -168,9 +171,16 @@ class Chunk(McapRecord):
         uncompressed_size = stream.read8()
         uncompressed_crc = stream.read4()
         compression_length = stream.read4()
-        compression = str(stream.read(compression_length), "utf-8")
+        compression_stream = stream.bounded(compression_length)
+        compression_bytes = compression_stream.read(compression_length)
+        try:
+            compression = str(compression_bytes, "utf-8")
+        except UnicodeDecodeError as exc:
+            raise McapFormatError(f"invalid UTF-8 in chunk compression: {exc}") from exc
         data_length = stream.read8()
-        data = stream.read(data_length)
+        # The chunk payload is read through a bounded view so a declared length that runs past the
+        # record boundary cannot consume the following record.
+        data = stream.bounded(data_length).read(data_length)
         return Chunk(
             compression=compression,
             data=data,
@@ -217,10 +227,10 @@ class ChunkIndex(McapRecord):
         chunk_length = stream.read8()
         message_index_offsets_length = stream.read4()
         message_index_offsets: Dict[int, int] = {}
-        offsets_end = stream.count + message_index_offsets_length
-        while stream.count < offsets_end:
-            channel_id = stream.read2()
-            channel_offset = stream.read8()
+        offsets_stream = stream.bounded(message_index_offsets_length)
+        while offsets_stream.remaining > 0:
+            channel_id = offsets_stream.read2()
+            channel_offset = offsets_stream.read8()
             message_index_offsets[channel_id] = channel_offset
         message_index_length = stream.read8()
         compression = stream.read_prefixed_string()
@@ -316,6 +326,12 @@ class Message(McapRecord):
 
     @staticmethod
     def read(stream: ReadDataStream, length: int):
+        # A message body smaller than its fixed 22-byte header cannot contain any payload, and must
+        # not be "completed" by reading into the next record.
+        if length < 22:
+            raise McapFormatError(
+                f"message record has length {length}, shorter than its 22-byte fixed header"
+            )
         channel_id = stream.read2()
         sequence = stream.read4()
         log_time = stream.read8()
@@ -349,10 +365,10 @@ class MessageIndex(McapRecord):
         channel_id = stream.read2()
         records_length = stream.read4()
         entries: list[Tuple[int, int]] = []
-        records_end = stream.count + records_length
-        while stream.count < records_end:
-            timestamp = stream.read8()
-            offset = stream.read8()
+        records_stream = stream.bounded(records_length)
+        while records_stream.remaining > 0:
+            timestamp = records_stream.read8()
+            offset = records_stream.read8()
             entries.append((timestamp, offset))
         return MessageIndex(channel_id, entries)
 
@@ -380,11 +396,11 @@ class Metadata(McapRecord):
     def read(stream: ReadDataStream):
         name = stream.read_prefixed_string()
         metadata_length = stream.read4()
-        metadata_end = stream.count + metadata_length
         metadata: Dict[str, str] = {}
-        while stream.count < metadata_end:
-            key = stream.read_prefixed_string()
-            value = stream.read_prefixed_string()
+        map_stream = stream.bounded(metadata_length)
+        while map_stream.remaining > 0:
+            key = map_stream.read_prefixed_string()
+            value = map_stream.read_prefixed_string()
             metadata[key] = value
         return Metadata(name=name, metadata=metadata)
 
@@ -476,10 +492,10 @@ class Statistics(McapRecord):
         message_end_time = stream.read8()
         channel_message_counts_length = stream.read4()
         message_counts: Dict[int, int] = {}
-        counts_end = stream.count + channel_message_counts_length
-        while stream.count < counts_end:
-            channel_id = stream.read2()
-            channel_message_count = stream.read8()
+        counts_stream = stream.bounded(channel_message_counts_length)
+        while counts_stream.remaining > 0:
+            channel_id = counts_stream.read2()
+            channel_message_count = counts_stream.read8()
             message_counts[channel_id] = channel_message_count
         return Statistics(
             attachment_count=attachment_count,
@@ -512,6 +528,8 @@ class PrivateRecord(McapRecord):
 
     @staticmethod
     def read(stream: ReadDataStream, opcode: int, length: int):
+        # The private record body is consumed entirely within the bounded view supplied by the
+        # dispatcher, so it cannot read beyond the declared record length.
         return PrivateRecord(opcode=opcode, data=stream.read(length))
 
 

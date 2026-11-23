@@ -20,7 +20,11 @@ from typing import (
 from ._message_queue import ChunkCandidate, make_message_queue
 from .data_stream import ReadDataStream, RecordBuilder
 from .decoder import DecoderFactory
-from .exceptions import DecoderNotFoundError, McapError
+from .exceptions import (
+    DecoderNotFoundError,
+    McapError,
+    McapFormatError,
+)
 from .opcode import Opcode
 from .publish_time_index import (
     PUBLISH_TIME_INDEX_MAGIC,
@@ -44,7 +48,14 @@ from .records import (
     Schema,
     Statistics,
 )
-from .stream_reader import MAGIC_SIZE, StreamReader, breakup_chunk, read_magic
+from .stream_reader import (
+    MAGIC_SIZE,
+    StreamReader,
+    _check_record_size_limit,
+    _parse_record,
+    breakup_chunk,
+    read_magic,
+)
 from .summary import Summary
 
 TIME_BASES = ("log", "publish")
@@ -595,7 +606,11 @@ class SeekingReader(McapReader):
     ) -> Iterator[Tuple[Optional[Schema], Channel, Message]]:
         """Scan the whole file with a non-seeking reader (used when no index can locate data)."""
         self._stream.seek(0, io.SEEK_SET)
-        yield from NonSeekingReader(self._stream).iter_messages(
+        yield from NonSeekingReader(
+            self._stream,
+            validate_crcs=self._validate_crcs,
+            record_size_limit=self._record_size_limit,
+        ).iter_messages(
             topics,
             start_time,
             end_time,
@@ -603,6 +618,50 @@ class SeekingReader(McapReader):
             reverse,
             time_basis=time_basis,
         )
+
+    def _read_record_at(
+        self,
+        offset: int,
+        expected_opcode: int,
+        expected_length: Optional[int] = None,
+    ) -> McapRecord:
+        """Read a single record located by a summary index.
+
+        The target record's opcode and outer body length are read and validated *before* its body
+        is parsed, so an index that points at the wrong record or an oversized or corrupted record
+        cannot be silently accepted. The body is parsed inside a bounded view over exactly its
+        declared length, and the same :attr:`_record_size_limit` applied to sequential scans is
+        enforced.
+        """
+        self._stream.seek(offset, io.SEEK_SET)
+        data_stream = ReadDataStream(self._stream)
+        opcode = data_stream.read1()
+        if opcode != expected_opcode:
+            raise McapFormatError(
+                f"index points at offset {offset} expecting opcode "
+                f"{int(expected_opcode)}, found opcode {int(opcode)}"
+            )
+        length = data_stream.read8()
+        if expected_length is not None and length != expected_length:
+            raise McapFormatError(
+                f"indexed record at offset {offset} has body length {length}, expected "
+                f"{expected_length}"
+            )
+        _check_record_size_limit(opcode, length, self._record_size_limit)
+        record_stream = data_stream.bounded(length)
+        record = _parse_record(
+            opcode,
+            length,
+            record_stream,
+            record_size_limit=self._record_size_limit,
+            emit_private_records=False,
+        )
+        record_stream.discard(record_stream.remaining)
+        if record is None:
+            raise McapFormatError(
+                f"record at offset {offset} with opcode {int(opcode)} could not be parsed"
+            )
+        return record
 
     def _get_publish_time_index(
         self, summary: Summary
@@ -666,10 +725,23 @@ class SeekingReader(McapReader):
                     if isinstance(next_item, ChunkCandidate)
                     else next_item
                 )
-                self._stream.seek(chunk_index.chunk_start_offset + 1 + 8, io.SEEK_SET)
-                chunk = Chunk.read(ReadDataStream(self._stream))
+                # Validate the chunk's opcode and outer length (and the size limit) before reading
+                # any of its body, matching the sequential reader's contract.
+                chunk = self._read_record_at(
+                    chunk_index.chunk_start_offset,
+                    Opcode.CHUNK,
+                    expected_length=chunk_index.chunk_length - 9,
+                )
+                if not isinstance(chunk, Chunk):
+                    raise McapError(
+                        f"expected chunk record, got {type(chunk).__name__}"
+                    )
                 for index, record in enumerate(
-                    breakup_chunk(chunk, validate_crc=self._validate_crcs)
+                    breakup_chunk(
+                        chunk,
+                        validate_crc=self._validate_crcs,
+                        record_size_limit=self._record_size_limit,
+                    )
                 ):
                     if not isinstance(record, Message):
                         continue
@@ -747,21 +819,24 @@ class SeekingReader(McapReader):
         if summary is None:
             # no index available, use a non-seeking reader to read linearly through the stream.
             self._stream.seek(0, io.SEEK_SET)
-            yield from NonSeekingReader(self._stream).iter_attachments()
+            yield from NonSeekingReader(
+                self._stream,
+                validate_crcs=self._validate_crcs,
+                record_size_limit=self._record_size_limit,
+            ).iter_attachments()
             return
         for attachment_index in summary.attachment_indexes:
-            self._stream.seek(attachment_index.offset)
-            record = next(
-                StreamReader(
-                    self._stream,
-                    skip_magic=True,
-                    record_size_limit=self._record_size_limit,
-                ).records
+            record = self._read_record_at(
+                attachment_index.offset,
+                Opcode.ATTACHMENT,
+                expected_length=attachment_index.length - 9,
             )
             if isinstance(record, Attachment):
                 yield record
             else:
-                raise McapError(f"expected attachment record, got {type(record)}")
+                raise McapError(
+                    f"expected attachment record, got {type(record).__name__}"
+                )
 
     def iter_metadata(self) -> Iterator[Metadata]:
         """Iterates through metadata records in the MCAP."""
@@ -769,21 +844,22 @@ class SeekingReader(McapReader):
         if summary is None:
             # fall back to a non-seeking reader
             self._stream.seek(0, io.SEEK_SET)
-            yield from NonSeekingReader(self._stream).iter_metadata()
+            yield from NonSeekingReader(
+                self._stream,
+                validate_crcs=self._validate_crcs,
+                record_size_limit=self._record_size_limit,
+            ).iter_metadata()
             return
         for metadata_index in summary.metadata_indexes:
-            self._stream.seek(metadata_index.offset)
-            record = next(
-                StreamReader(
-                    self._stream,
-                    skip_magic=True,
-                    record_size_limit=self._record_size_limit,
-                ).records
+            record = self._read_record_at(
+                metadata_index.offset,
+                Opcode.METADATA,
+                expected_length=metadata_index.length - 9,
             )
             if isinstance(record, Metadata):
                 yield record
             else:
-                raise McapError(f"expected attachment record, got {type(record)}")
+                raise McapError(f"expected metadata record, got {type(record).__name__}")
 
 
 class NonSeekingReader(McapReader):

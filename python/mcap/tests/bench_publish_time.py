@@ -172,9 +172,13 @@ def measure(content: bytes, distribution: str, num_chunks: int) -> Dict[str, flo
     decompressed = [0]
     original_breakup = reader_module.breakup_chunk
 
-    def tracking_breakup(chunk, validate_crc=False):
+    def tracking_breakup(chunk, validate_crc=False, record_size_limit=None):
         decompressed[0] += 1
-        return original_breakup(chunk, validate_crc=validate_crc)
+        return original_breakup(
+            chunk,
+            validate_crc=validate_crc,
+            record_size_limit=record_size_limit,
+        )
 
     topics, start, end = _query(distribution, num_chunks)
     reader_module.breakup_chunk = tracking_breakup

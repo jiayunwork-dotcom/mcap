@@ -13,9 +13,10 @@ try:
 except ImportError:
     zstandard = None
 
-from .data_stream import ReadDataStream
+from .data_stream import BoundedReadDataStream, ReadDataStream
 from .exceptions import (
     InvalidMagic,
+    McapFormatError,
     RecordLengthLimitExceeded,
     UnsupportedCompressionError,
 )
@@ -56,24 +57,106 @@ class CRCValidationError(ValueError):
         )
 
 
-def breakup_chunk(chunk: Chunk, validate_crc: bool = False) -> List[McapRecord]:
+def _check_record_size_limit(
+    opcode: int, length: int, record_size_limit: Optional[int]
+) -> None:
+    """Reject a record whose declared body length exceeds the configured limit.
+
+    The check happens before any byte of the record body is requested, so an oversized body is
+    never read. ``None`` means no limit is applied.
+    """
+    if record_size_limit is not None and length > record_size_limit:
+        raise RecordLengthLimitExceeded(opcode, length, record_size_limit)
+
+
+def _parse_record(
+    opcode: int,
+    length: int,
+    stream: BoundedReadDataStream,
+    *,
+    record_size_limit: Optional[int],
+    emit_private_records: bool,
+) -> Optional[McapRecord]:
+    """Parse one record body from a stream already constrained to that body's declared length.
+
+    ``stream`` is a bounded view covering exactly the record body, so no parser can consume bytes
+    belonging to the next record or field. Bytes left over after a known record's fixed fields are
+    legal extension bytes and are discarded inside the same boundary.
+    """
+    record: Optional[McapRecord]
+    if opcode == Opcode.ATTACHMENT:
+        record = Attachment.read(stream)
+    elif opcode == Opcode.ATTACHMENT_INDEX:
+        record = AttachmentIndex.read(stream)
+    elif opcode == Opcode.CHANNEL:
+        record = Channel.read(stream)
+    elif opcode == Opcode.CHUNK:
+        record = Chunk.read(stream)
+    elif opcode == Opcode.CHUNK_INDEX:
+        record = ChunkIndex.read(stream)
+    elif opcode == Opcode.DATA_END:
+        record = DataEnd.read(stream)
+    elif opcode == Opcode.FOOTER:
+        record = Footer.read(stream)
+    elif opcode == Opcode.HEADER:
+        record = Header.read(stream)
+    elif opcode == Opcode.MESSAGE:
+        record = Message.read(stream, length)
+    elif opcode == Opcode.MESSAGE_INDEX:
+        record = MessageIndex.read(stream)
+    elif opcode == Opcode.METADATA:
+        record = Metadata.read(stream)
+    elif opcode == Opcode.METADATA_INDEX:
+        record = MetadataIndex.read(stream)
+    elif opcode == Opcode.SCHEMA:
+        record = Schema.read(stream)
+    elif opcode == Opcode.STATISTICS:
+        record = Statistics.read(stream)
+    elif opcode == Opcode.SUMMARY_OFFSET:
+        record = SummaryOffset.read(stream)
+    elif emit_private_records and 0x80 <= opcode <= 0xFF:
+        record = PrivateRecord.read(stream, opcode, length)
+    else:
+        # Unknown record type (including skipped private records such as the publish-time index).
+        # Its outer length was already validated; discard the body without retaining it.
+        stream.discard(length)
+        return None
+
+    # Known records may carry legal extension bytes after their documented fields; skip anything
+    # left within this record's own boundary, never touching the next record.
+    stream.discard(stream.remaining)
+    return record
+
+
+def breakup_chunk(
+    chunk: Chunk,
+    validate_crc: bool = False,
+    record_size_limit: Optional[int] = 4 * 2**30,
+) -> List[McapRecord]:
+    """Parse the records contained inside a (decompressed) chunk.
+
+    Every inner record is read inside a bounded view over its own declared body length and checked
+    against ``record_size_limit``, the same constraint applied to top-level records. The length of
+    the whole decompressed chunk is never treated as the length of a single record.
+    """
     stream, stream_length = get_chunk_data_stream(chunk, validate_crc=validate_crc)
     records: List[McapRecord] = []
     while stream.count < stream_length:
         opcode = stream.read1()
         length = stream.read8()
-        if opcode == Opcode.CHANNEL:
-            channel = Channel.read(stream)
-            records.append(channel)
-        elif opcode == Opcode.MESSAGE:
-            message = Message.read(stream, length)
-            records.append(message)
-        elif opcode == Opcode.SCHEMA:
-            schema = Schema.read(stream)
-            records.append(schema)
-        else:
-            # Unknown chunk record type
-            stream.read(length)
+        _check_record_size_limit(opcode, length, record_size_limit)
+        record_stream = stream.bounded(length)
+        record = _parse_record(
+            opcode,
+            length,
+            record_stream,
+            record_size_limit=record_size_limit,
+            emit_private_records=False,
+        )
+        if isinstance(record, (Channel, Message, Schema)):
+            records.append(record)
+        # Unknown or unexpected inner record types are skipped inside their bounded view.
+        record_stream.discard(record_stream.remaining)
 
     return records
 
@@ -105,7 +188,10 @@ def get_chunk_data_stream(
 
 
 def read_magic(stream: ReadDataStream) -> bool:
-    magic = struct.unpack("<8B", stream.read(MAGIC_SIZE))
+    try:
+        magic = struct.unpack("<8B", stream.read(MAGIC_SIZE))
+    except struct.error as exc:
+        raise McapFormatError(f"failed to decode the MCAP magic: {exc}") from exc
     if magic != (137, 77, 67, 65, 80, 48, 13, 10):
         raise InvalidMagic(magic)
     return True
@@ -175,10 +261,27 @@ class StreamReader:
                 checksum_before_read = self._stream.checksum()
             opcode = self._stream.read1()
             length = self._stream.read8()
-            if self._record_size_limit is not None and length > self._record_size_limit:
-                raise RecordLengthLimitExceeded(opcode, length, self._record_size_limit)
+            # Enforce the size limit before requesting any of the record body.
+            _check_record_size_limit(opcode, length, self._record_size_limit)
             count = self._stream.count
-            record = self._read_record(opcode, length)
+            # The parser only ever sees a view over this record's declared body.
+            record_stream = self._stream.bounded(length)
+            record = _parse_record(
+                opcode,
+                length,
+                record_stream,
+                record_size_limit=self._record_size_limit,
+                emit_private_records=self._emit_private_records,
+            )
+            # Anything the parser did not consume must still belong to this record (legal
+            # extension bytes) and is skipped inside its boundary.
+            record_stream.discard(record_stream.remaining)
+            consumed = self._stream.count - count
+            if consumed != length:
+                raise McapFormatError(
+                    f"record with opcode {opcode} declared {length} body bytes but "
+                    f"{consumed} were consumed"
+                )
             if (
                 self._validate_crcs
                 and not self._skip_magic
@@ -191,11 +294,12 @@ class StreamReader:
                     actual=checksum_before_read,
                     record=record,
                 )
-            padding = length - (self._stream.count - count)
-            if padding > 0:
-                self._stream.read(padding)
             if isinstance(record, Chunk) and not self._emit_chunks:
-                chunk_records = breakup_chunk(record, validate_crc=self._validate_crcs)
+                chunk_records = breakup_chunk(
+                    record,
+                    validate_crc=self._validate_crcs,
+                    record_size_limit=self._record_size_limit,
+                )
                 for chunk_record in chunk_records:
                     yield chunk_record
             elif record:
@@ -203,45 +307,6 @@ class StreamReader:
             if isinstance(record, Footer):
                 self._footer = record
                 read_magic(self._stream)
-
-    def _read_record(self, opcode: int, length: int) -> Optional[McapRecord]:
-        if opcode == Opcode.ATTACHMENT:
-            return Attachment.read(self._stream)
-        if opcode == Opcode.ATTACHMENT_INDEX:
-            return AttachmentIndex.read(self._stream)
-        if opcode == Opcode.CHANNEL:
-            return Channel.read(self._stream)
-        if opcode == Opcode.CHUNK:
-            return Chunk.read(self._stream)
-        if opcode == Opcode.CHUNK_INDEX:
-            return ChunkIndex.read(self._stream)
-        if opcode == Opcode.DATA_END:
-            return DataEnd.read(self._stream)
-        if opcode == Opcode.FOOTER:
-            return Footer.read(self._stream)
-        if opcode == Opcode.HEADER:
-            return Header.read(self._stream)
-        if opcode == Opcode.MESSAGE:
-            return Message.read(self._stream, length)
-        if opcode == Opcode.MESSAGE_INDEX:
-            return MessageIndex.read(self._stream)
-        if opcode == Opcode.METADATA:
-            return Metadata.read(self._stream)
-        if opcode == Opcode.METADATA_INDEX:
-            return MetadataIndex.read(self._stream)
-        if opcode == Opcode.SCHEMA:
-            return Schema.read(self._stream)
-        if opcode == Opcode.STATISTICS:
-            return Statistics.read(self._stream)
-        if opcode == Opcode.SUMMARY_OFFSET:
-            return SummaryOffset.read(self._stream)
-
-        if self._emit_private_records and 0x80 <= opcode <= 0xFF:
-            return PrivateRecord.read(self._stream, opcode, length)
-
-        # Skip unknown record types, including private records such as the publish-time index.
-        self._stream.read(length)
-        return None
 
 
 __all__ = ["StreamReader"]

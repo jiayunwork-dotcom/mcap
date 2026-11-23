@@ -847,9 +847,13 @@ def _run_counted(content: bytes, **kwargs):
     decompressed: List[int] = []
     original_breakup = reader_module.breakup_chunk
 
-    def tracking_breakup(chunk, validate_crc=False):
+    def tracking_breakup(chunk, validate_crc=False, record_size_limit=None):
         decompressed.append(1)
-        return original_breakup(chunk, validate_crc=validate_crc)
+        return original_breakup(
+            chunk,
+            validate_crc=validate_crc,
+            record_size_limit=record_size_limit,
+        )
 
     reader_module.breakup_chunk = tracking_breakup
     try:
