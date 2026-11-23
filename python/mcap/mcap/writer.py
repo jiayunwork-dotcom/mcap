@@ -22,6 +22,10 @@ from mcap import __version__
 from ._chunk_builder import ChunkBuilder
 from .data_stream import RecordBuilder
 from .opcode import Opcode
+from .publish_time_index import (
+    PublishTimeIndexEntry,
+    write_publish_time_index,
+)
 from .records import (
     Attachment,
     AttachmentIndex,
@@ -73,6 +77,12 @@ class Writer:
     :param use_chunking: Group data in chunks.
     :param use_statistics: Write statistics record.
     :param use_summary_offsets: Write summary offset records.
+    :param publish_time_index: If True, additionally write a private summary record describing the
+        per-chunk, per-channel distribution of message ``publish_time`` values, so that
+        :py:meth:`~mcap.reader.McapReader.iter_messages` can filter and order by publish time
+        without reading chunks that cannot match. Requires ``use_chunking=True`` and
+        ``index_types`` including :py:attr:`~mcap.writer.IndexType.CHUNK`; both are validated
+        before anything is written. Readers that do not know about the record ignore it.
     """
 
     def __init__(
@@ -88,7 +98,17 @@ class Writer:
         use_summary_offsets: bool = True,
         enable_crcs: bool = True,
         enable_data_crcs: bool = False,
+        publish_time_index: bool = False,
     ):
+        if not isinstance(publish_time_index, bool):
+            raise ValueError("publish_time_index must be a bool")
+        if publish_time_index:
+            if not use_chunking:
+                raise ValueError("publish_time_index requires use_chunking=True")
+            if not (index_types & IndexType.CHUNK):
+                raise ValueError(
+                    "publish_time_index requires index_types to include IndexType.CHUNK"
+                )
         self.__should_close = False
         if isinstance(output, str):
             self.__stream = open(output, "wb")
@@ -101,7 +121,11 @@ class Writer:
         self.__attachment_indexes: list[AttachmentIndex] = []
         self.__metadata_indexes: list[MetadataIndex] = []
         self.__channels: OrderedDict[int, Channel] = OrderedDict()
-        self.__chunk_builder = ChunkBuilder() if use_chunking else None
+        self.__chunk_builder = (
+            ChunkBuilder(track_publish_times=publish_time_index)
+            if use_chunking
+            else None
+        )
         self.__chunk_indices: List[ChunkIndex] = []
         self.__chunk_size = chunk_size
         self.__compression = compression
@@ -126,6 +150,8 @@ class Writer:
         self.__enable_crcs = enable_crcs
         self.__enable_data_crcs = enable_data_crcs
         self.__data_section_crc = 0
+        self.__publish_time_index = publish_time_index
+        self.__publish_time_index_entries: List[PublishTimeIndexEntry] = []
 
         # validate compression
         if self.__compression == CompressionType.LZ4:
@@ -295,6 +321,12 @@ class Writer:
                     group_length=summary_builder.count - group_start,
                 )
             )
+
+        if self.__publish_time_index:
+            # The extension is a private record, so no SummaryOffset group is emitted for it: an
+            # implementation that only walks the known summary-offset groups is still free to
+            # ignore it. Readers that walk the summary records find it in place.
+            write_publish_time_index(summary_builder, self.__publish_time_index_entries)
 
         if self.__index_types & IndexType.ATTACHMENT:
             group_start = summary_builder.count
@@ -493,6 +525,19 @@ class Writer:
         self.__flush()
 
         self.__chunk_indices.append(chunk_index)
+        if self.__publish_time_index:
+            self.__publish_time_index_entries.append(
+                PublishTimeIndexEntry(
+                    chunk_start_offset=chunk_start_offset,
+                    chunk_length=chunk_size,
+                    channel_publish_times={
+                        channel_id: (envelope[0], envelope[1])
+                        for channel_id, envelope in (
+                            self.__chunk_builder.publish_time_envelopes.items()
+                        )
+                    },
+                )
+            )
         self.__chunk_builder.reset()
 
     def __maybe_finalize_chunk(self):

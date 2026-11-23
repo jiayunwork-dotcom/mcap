@@ -1,7 +1,7 @@
 import struct
 import zlib
 from io import BytesIO
-from typing import IO, Optional
+from typing import IO, Optional, Union
 
 from .exceptions import EndOfFile
 from .opcode import Opcode
@@ -66,7 +66,7 @@ class RecordBuilder:
     def count(self) -> int:
         return self._buffer.tell()
 
-    def start_record(self, opcode: Opcode):
+    def start_record(self, opcode: Union[Opcode, int]):
         self._record_start_offset = self._buffer.tell()
         self._buffer.write(struct.pack("<BQ", opcode, 0))  # placeholder size
 

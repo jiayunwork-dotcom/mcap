@@ -495,6 +495,27 @@ class Statistics(McapRecord):
 
 
 @dataclass
+class PrivateRecord(McapRecord):
+    """A record whose opcode is not part of the MCAP specification (0x80-0xFF).
+
+    These are application extensions. ``StreamReader`` only emits them when constructed with
+    ``emit_private_records=True``; otherwise their contents are skipped.
+    """
+
+    opcode: int
+    data: bytes
+
+    def write(self, stream: RecordBuilder):
+        stream.start_record(self.opcode)
+        stream.write(self.data)
+        stream.finish_record()
+
+    @staticmethod
+    def read(stream: ReadDataStream, opcode: int, length: int):
+        return PrivateRecord(opcode=opcode, data=stream.read(length))
+
+
+@dataclass
 class SummaryOffset(McapRecord):
     group_opcode: int
     group_start: int

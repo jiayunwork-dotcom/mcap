@@ -18,3 +18,7 @@ class Opcode(IntEnum):
     SCHEMA = 0x03
     STATISTICS = 0x0B
     SUMMARY_OFFSET = 0x0E
+    # Private record in the application-extension range (0x80-0xFF). Used for the optional
+    # publish-time index written by Writer(publish_time_index=True). See
+    # mcap.publish_time_index for the record layout.
+    PUBLISH_TIME_INDEX = 0x80

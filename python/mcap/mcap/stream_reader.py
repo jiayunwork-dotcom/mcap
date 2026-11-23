@@ -34,6 +34,7 @@ from .records import (
     MessageIndex,
     Metadata,
     MetadataIndex,
+    PrivateRecord,
     Schema,
     Statistics,
     SummaryOffset,
@@ -124,6 +125,8 @@ class StreamReader:
         greater length, it will throw an :py:class:`~mcap.exceptions.RecordLengthLimitExceeded`
         error.  Setting to ``None`` removes the limit, but can allow corrupted MCAP files to trigger
         a `MemoryError` exception.
+    :param emit_private_records: if ``True``, private records (opcodes 0x80-0xFF) are returned as
+        :py:class:`~mcap.records.PrivateRecord` instances rather than skipped.
     """
 
     def __init__(
@@ -133,6 +136,7 @@ class StreamReader:
         emit_chunks: bool = False,
         validate_crcs: bool = False,
         record_size_limit: Optional[int] = (4 * 2**30),  # 4 Gib
+        emit_private_records: bool = False,
     ):
         """
         input: The input stream from which to read records.
@@ -153,6 +157,7 @@ class StreamReader:
         self._validate_crcs: bool = validate_crcs
         self._calculated_data_section_crc = None
         self._record_size_limit = record_size_limit
+        self._emit_private_records = emit_private_records
 
     @property
     def records(self) -> Iterator[McapRecord]:
@@ -231,8 +236,12 @@ class StreamReader:
         if opcode == Opcode.SUMMARY_OFFSET:
             return SummaryOffset.read(self._stream)
 
-        # Skip unknown record types
+        if self._emit_private_records and 0x80 <= opcode <= 0xFF:
+            return PrivateRecord.read(self._stream, opcode, length)
+
+        # Skip unknown record types, including private records such as the publish-time index.
         self._stream.read(length)
+        return None
 
 
 __all__ = ["StreamReader"]

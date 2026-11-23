@@ -21,6 +21,9 @@ class Summary:
             attachments in the MCAP.
         :ivar metadata_indexes: a list of MetadataIndex records, indicating the offset of metadata
             records in the MCAP.
+        :ivar publish_time_indexes: raw bodies of any private publish-time index records present in
+            the summary section. These are only interpreted by publish-time queries; readers that
+            do not ask for one behave exactly as if the records were absent.
         """
         self.statistics: Optional[Statistics] = None
         self.schemas: Dict[int, Schema] = {}
@@ -28,3 +31,4 @@ class Summary:
         self.chunk_indexes: List[ChunkIndex] = []
         self.attachment_indexes: List[AttachmentIndex] = []
         self.metadata_indexes: List[MetadataIndex] = []
+        self.publish_time_indexes: List[bytes] = []
